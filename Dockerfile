@@ -2,73 +2,73 @@
 # Credit Default Risk Scoring API
 # DDM501 - Lab 1: First ML Product
 #
-# TODO: Complete this Dockerfile.
+# Build:  docker build -t credit-risk-api .
+# Run:    docker compose up --build      (mounts ./models read-only)
 # =============================================================================
 FROM python:3.11-slim
 
 # -----------------------------------------------------------------------------
-# TODO 1: Set the environment variables
+# 1. Environment
 # -----------------------------------------------------------------------------
-# Requirements:
-#   PYTHONDONTWRITEBYTECODE=1   do not litter the image with .pyc files
-#   PYTHONUNBUFFERED=1          flush stdout immediately, so `docker logs`
-#                               shows output as it happens instead of when the
-#                               buffer fills. Without this, a container that
-#                               crashes often appears to have logged nothing.
-#   PYTHONPATH=/app             so `from app.main import app` resolves
-#
+#   PYTHONDONTWRITEBYTECODE  no .pyc files in the image
+#   PYTHONUNBUFFERED         stdout goes straight to `docker logs`; without it a
+#                            container that crashes often appears to have logged
+#                            nothing
+#   PYTHONPATH               so `from app.main import app` resolves from /app
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
 
 # -----------------------------------------------------------------------------
-# TODO 2: Set the working directory
+# 2. Working directory
 # -----------------------------------------------------------------------------
-# Hint: WORKDIR /app
+WORKDIR /app
 
 # -----------------------------------------------------------------------------
-# TODO 3: Install dependencies
+# 3. Dependencies BEFORE source
 # -----------------------------------------------------------------------------
-# Requirements:
-#   - copy requirements.txt on its own FIRST, then run pip install,
-#     then copy the source
-#   - use pip install --no-cache-dir
-#
+# requirements.txt changes rarely, the code changes on every commit. Copying it
+# alone first means this slow layer stays cached when only app/ changes.
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
 # -----------------------------------------------------------------------------
-# TODO 4: Copy the application code
+# 4. Application code
 # -----------------------------------------------------------------------------
-# Requirements: copy app/, scripts/ and data/
-# Note we do NOT copy models/ — see docker-compose.yml for why.
+# models/ is NOT copied: the artifact is mounted at run time (docker-compose.yml),
+# so a retrained model ships without rebuilding the image.
+COPY app/ ./app/
+COPY scripts/ ./scripts/
+COPY data/ ./data/
 
 # -----------------------------------------------------------------------------
-# TODO 5: Create and switch to a non-root user
+# 5. Non-root user
 # -----------------------------------------------------------------------------
-# Requirements:
-#   - create a user `appuser` with uid 1000 and a home directory
-#   - create /app/models and give appuser ownership of /app
-#   - switch to that user with USER
-#
 # A container running as root that gets compromised is a host running as root.
-# This is three lines and it is not optional in production.
-#
-# -----------------------------------------------------------------------------
-# TODO 6: Expose the port
-# -----------------------------------------------------------------------------
-# Hint: EXPOSE 8000
+RUN useradd --uid 1000 --create-home --shell /usr/sbin/nologin appuser \
+    && mkdir -p /app/models \
+    && chown -R appuser:appuser /app
+USER appuser
 
 # -----------------------------------------------------------------------------
-# TODO 7: Add a health check
+# 6. Port
 # -----------------------------------------------------------------------------
-# Requirements:
-#   - check every 30s, time out after 10s, allow 10s of start-up, retry 3 times
-#   - it must call GET /health AND check that model_loaded is true
-#
+EXPOSE 8000
 
 # -----------------------------------------------------------------------------
-# TODO 8: Set the startup command
+# 7. Health check
 # -----------------------------------------------------------------------------
-# Requirements: run uvicorn on app.main:app, bound to 0.0.0.0:8000
-#
-# Binding to 127.0.0.1 inside a container is a classic mistake: the service
-# comes up, the logs look perfect, and nothing outside the container can reach
-# it. Use 0.0.0.0.
-#
-# Hint: CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
+# "Process is up" is not enough: without its model the API answers /health with
+# 200 but every /predict with 503. So the check passes only when the JSON body
+# says model_loaded is true. The slim image has no curl, and Python is already
+# here, so the check uses the standard library instead of adding a package.
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+    CMD ["python", "-c", "import json, sys, urllib.request; body = json.load(urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5)); sys.exit(0 if body.get('model_loaded') is True else 1)"]
+
+# -----------------------------------------------------------------------------
+# 8. Startup command
+# -----------------------------------------------------------------------------
+# 0.0.0.0, not 127.0.0.1: inside a container, loopback is the container's own,
+# so a service bound to it looks healthy in the logs and is unreachable from
+# outside. Exec form so uvicorn is PID 1 and receives SIGTERM on `docker stop`.
+CMD ["uvicorn", "app.main:app", "--host", "0.0.0.0", "--port", "8000"]
