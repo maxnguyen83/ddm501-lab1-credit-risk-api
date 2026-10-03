@@ -4,8 +4,6 @@ Tests for the Credit Default Risk Scoring API.
 Run with:
     pytest tests/ -v
     pytest tests/ -v --cov=app --cov-report=term-missing
-
-TODO: Complete the test cases marked below.
 """
 
 import copy
@@ -13,6 +11,7 @@ import copy
 import pytest
 from fastapi.testclient import TestClient
 
+import app.main as main_module
 from app.main import app
 
 # A well-behaved applicant: always paid on time, low utilisation.
@@ -84,22 +83,68 @@ class TestInfoEndpoints:
         assert data["is_loaded"] is True
         assert 0.5 < data["metrics"]["roc_auc"] <= 1.0
 
+    def test_model_info_reports_thresholds(self, client):
+        data = client.get("/model/info").json()
+        assert data["review_threshold"] < data["decline_threshold"]
+        assert data["model_type"] == "HistGradientBoostingClassifier"
+
+    def test_swagger_docs_are_served(self, client):
+        assert client.get("/docs").status_code == 200
+        paths = client.get("/openapi.json").json()["paths"]
+        assert {"/health", "/predict", "/predict/batch", "/model/info"} <= set(paths)
+
+
+# Helpers used by the tests below.
+RESPONSE_FIELDS = {
+    "default_probability",
+    "risk_band",
+    "decision",
+    "review_threshold",
+    "decline_threshold",
+    "model_version",
+}
+
+
+def predict(client, application):
+    """POST one application to /predict and return the parsed JSON body."""
+    response = client.post("/predict", json=application)
+    assert response.status_code == 200, response.text
+    return response.json()
+
+
+def expected_decision(probability, review, decline):
+    """The band/decision the two thresholds imply, computed independently."""
+    if probability >= decline:
+        return "HIGH", "DECLINE"
+    if probability >= review:
+        return "MEDIUM", "REVIEW"
+    return "LOW", "APPROVE"
+
+
+def with_field(field, value, base=GOOD_APPLICANT):
+    """Deep copy of an applicant with one field overwritten."""
+    application = copy.deepcopy(base)
+    application[field] = value
+    return application
+
 
 # =============================================================================
-# TODO 1: Happy-path tests for /predict
+# Happy-path tests for /predict
 # =============================================================================
 class TestPredictEndpoint:
     """The /predict endpoint — happy path."""
 
     def test_valid_application_returns_200(self, client):
         """POST GOOD_APPLICANT to /predict and assert the status code."""
-        # TODO: implement
-        pass
+        response = client.post("/predict", json=GOOD_APPLICANT)
+        assert response.status_code == 200
 
     def test_probability_is_a_valid_probability(self, client):
         """Assert default_probability is between 0.0 and 1.0 inclusive."""
-        # TODO: implement
-        pass
+        for applicant in (GOOD_APPLICANT, RISKY_APPLICANT):
+            probability = predict(client, applicant)["default_probability"]
+            assert isinstance(probability, float)
+            assert 0.0 <= probability <= 1.0
 
     def test_response_contains_every_field(self, client):
         """Assert the response has exactly the six documented fields.
@@ -108,8 +153,9 @@ class TestPredictEndpoint:
         accidental extra field — say, one carrying applicant data — fails the
         test instead of slipping into production.
         """
-        # TODO: implement
-        pass
+        data = predict(client, GOOD_APPLICANT)
+        assert set(data) == RESPONSE_FIELDS
+        assert data["model_version"] == main_module.MODEL_VERSION
 
     def test_decision_is_consistent_with_thresholds(self, client):
         """The decision must follow from the score — no third source of truth.
@@ -119,8 +165,25 @@ class TestPredictEndpoint:
         response and assert that decision and risk_band are what those three
         numbers imply.
         """
-        # TODO: implement
-        pass
+        for applicant in (GOOD_APPLICANT, RISKY_APPLICANT):
+            data = predict(client, applicant)
+            band, decision = expected_decision(
+                data["default_probability"],
+                data["review_threshold"],
+                data["decline_threshold"],
+            )
+            assert data["risk_band"] == band
+            assert data["decision"] == decision
+
+    def test_good_applicant_is_approved(self, client):
+        """Sanity anchor on the trained model: the textbook good customer is LOW."""
+        data = predict(client, GOOD_APPLICANT)
+        assert data["risk_band"] == "LOW"
+        assert data["decision"] == "APPROVE"
+
+    def test_risky_applicant_is_not_approved(self, client):
+        """Four months behind and paying nothing must not be auto-approved."""
+        assert predict(client, RISKY_APPLICANT)["decision"] in {"REVIEW", "DECLINE"}
 
     def test_deterministic(self, client):
         """The same request twice must give the same score.
@@ -128,20 +191,21 @@ class TestPredictEndpoint:
         Obvious? It stops being obvious the moment someone adds a timestamp
         feature, a random seed, or a cache.
         """
-        # TODO: implement
-        pass
+        assert predict(client, GOOD_APPLICANT) == predict(client, GOOD_APPLICANT)
+        assert predict(client, RISKY_APPLICANT) == predict(client, RISKY_APPLICANT)
 
 
 # =============================================================================
-# TODO 2: Behavioural tests
+# Behavioural tests
 # =============================================================================
 class TestModelBehaviour:
     """Properties the model must satisfy."""
 
     def test_risky_scores_higher_than_good(self, client):
         """RISKY_APPLICANT must get a higher probability than GOOD_APPLICANT."""
-        # TODO: implement
-        pass
+        good = predict(client, GOOD_APPLICANT)["default_probability"]
+        risky = predict(client, RISKY_APPLICANT)["default_probability"]
+        assert risky > good
 
     def test_more_delay_never_lowers_risk(self, client):
         """Monotonicity: worse repayment history must not reduce the score.
@@ -150,12 +214,18 @@ class TestModelBehaviour:
         pay_status to [1, 0, 0, 0, 0, 0] on one and [4, 3, 3, 2, 2, 2] on the
         other, and assert the second scores at least as high as the first.
         """
-        # TODO: implement
-        pass
+        slightly_late = copy.deepcopy(GOOD_APPLICANT)
+        slightly_late["pay_status"] = [1, 0, 0, 0, 0, 0]
+        very_late = copy.deepcopy(GOOD_APPLICANT)
+        very_late["pay_status"] = [4, 3, 3, 2, 2, 2]
+
+        low = predict(client, slightly_late)["default_probability"]
+        high = predict(client, very_late)["default_probability"]
+        assert high >= low
 
 
 # =============================================================================
-# TODO 3: Validation tests
+# Validation tests
 # =============================================================================
 # Every one of these must come back 422 — rejected by the schema, never
 # reaching the model.
@@ -180,18 +250,24 @@ class TestValidation:
         Hint: parametrize runs this once per (field, value) pair, so seven
         tests come out of one function body.
         """
-        # TODO: implement
-        pass
+        response = client.post("/predict", json=with_field(field, value))
+        assert response.status_code == 422
+        # The error names the offending field, so the caller can fix it.
+        assert response.json()["detail"][0]["loc"][-1] == field
 
     def test_missing_field_is_rejected(self, client):
         """Delete a required field and assert 422."""
-        # TODO: implement
-        pass
+        application = copy.deepcopy(GOOD_APPLICANT)
+        del application["age"]
+        response = client.post("/predict", json=application)
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "missing"
 
     def test_wrong_list_length_is_rejected(self, client):
         """Send pay_status with 3 entries instead of 6 and assert 422."""
-        # TODO: implement
-        pass
+        response = client.post("/predict", json=with_field("pay_status", [0, 0, 0]))
+        assert response.status_code == 422
+        assert response.json()["detail"][0]["type"] == "too_short"
 
     def test_pay_status_out_of_domain_is_rejected(self, client):
         """Send pay_status = [99, 0, 0, 0, 0, 0] and assert 422.
@@ -199,35 +275,78 @@ class TestValidation:
         This one only passes if you wrote the custom validator in schemas.py.
         Field bounds alone will not catch it.
         """
-        # TODO: implement
-        pass
+        response = client.post("/predict", json=with_field("pay_status", [99, 0, 0, 0, 0, 0]))
+        assert response.status_code == 422
+        assert "between -2 and 8" in response.json()["detail"][0]["msg"]
 
     def test_negative_payment_is_rejected(self, client):
         """Send a negative value in pay_amt and assert 422."""
-        # TODO: implement
-        pass
+        bad = with_field("pay_amt", [12000, 11500, -1, 10500, 10000, 9500])
+        response = client.post("/predict", json=bad)
+        assert response.status_code == 422
+        assert "cannot be negative" in response.json()["detail"][0]["msg"]
 
     def test_empty_body_is_rejected(self, client):
         """POST {} and assert 422."""
-        # TODO: implement
-        pass
+        response = client.post("/predict", json={})
+        assert response.status_code == 422
+        missing = {error["loc"][-1] for error in response.json()["detail"]}
+        assert missing == set(GOOD_APPLICANT)
+
+    def test_rejected_values_are_not_echoed_back(self, client):
+        """422 says where and why, but does not repeat the applicant's data."""
+        response = client.post("/predict", json=with_field("age", 150))
+        assert response.status_code == 422
+        error = response.json()["detail"][0]
+        assert set(error) == {"type", "loc", "msg"}
+        assert error["loc"] == ["body", "age"]
+
+    def test_malformed_json_is_rejected(self, client):
+        response = client.post(
+            "/predict", content="not json", headers={"Content-Type": "application/json"}
+        )
+        assert response.status_code == 422
+
+    def test_nan_is_rejected(self, client):
+        """NaN parses as JSON in Python but must not be scored as a missing value."""
+        body = (
+            '{"limit_bal":300000,"sex":2,"education":1,"marriage":2,"age":38,'
+            '"pay_status":[-1,-1,-1,-1,-1,-1],'
+            '"bill_amt":[NaN,11500,11000,10500,10000,9500],'
+            '"pay_amt":[12000,11500,11000,10500,10000,9500]}'
+        )
+        response = client.post(
+            "/predict", content=body, headers={"Content-Type": "application/json"}
+        )
+        assert response.status_code == 422
 
 
 # =============================================================================
-# TODO 4: Batch tests
+# Batch tests
 # =============================================================================
 class TestBatchEndpoint:
     """The /predict/batch endpoint."""
 
     def test_returns_one_result_per_application(self, client):
         """Send three applications, assert total_count and list length."""
-        # TODO: implement
-        pass
+        batch = {"applications": [GOOD_APPLICANT, RISKY_APPLICANT, GOOD_APPLICANT]}
+        response = client.post("/predict/batch", json=batch)
+        assert response.status_code == 200
+        data = response.json()
+        assert data["total_count"] == 3
+        assert len(data["predictions"]) == 3
+        assert all(set(p) == RESPONSE_FIELDS for p in data["predictions"])
 
     def test_order_is_preserved(self, client):
         """Send [GOOD, RISKY] and assert the second result scores higher."""
-        # TODO: implement
-        pass
+        batch = {"applications": [GOOD_APPLICANT, RISKY_APPLICANT]}
+        good, risky = client.post("/predict/batch", json=batch).json()["predictions"]
+        assert risky["default_probability"] > good["default_probability"]
+
+        # And the reverse order gives the reverse result.
+        batch = {"applications": [RISKY_APPLICANT, GOOD_APPLICANT]}
+        risky2, good2 = client.post("/predict/batch", json=batch).json()["predictions"]
+        assert (risky2, good2) == (risky, good)
 
     def test_matches_single_prediction(self, client):
         """A batch of one must give exactly what /predict gives.
@@ -235,10 +354,106 @@ class TestBatchEndpoint:
         This is the test that catches a batch path which quietly reorders
         columns or skips a preprocessing step.
         """
-        # TODO: implement
-        pass
+        for applicant in (GOOD_APPLICANT, RISKY_APPLICANT):
+            single = predict(client, applicant)
+            batch = client.post("/predict/batch", json={"applications": [applicant]}).json()
+            assert batch["predictions"] == [single]
 
     def test_empty_batch_is_rejected(self, client):
         """POST {"applications": []} and assert 422."""
-        # TODO: implement
-        pass
+        response = client.post("/predict/batch", json={"applications": []})
+        assert response.status_code == 422
+
+    def test_batch_calls_the_model_once(self, client, monkeypatch):
+        """500 applicants must cost one model call, not 500."""
+        scorer = main_module.model
+        calls = []
+        original = scorer.predict_proba
+
+        def counting_predict_proba(applications):
+            calls.append(len(applications))
+            return original(applications)
+
+        monkeypatch.setattr(scorer, "predict_proba", counting_predict_proba)
+        response = client.post("/predict/batch", json={"applications": [GOOD_APPLICANT] * 500})
+        assert response.status_code == 200
+        assert response.json()["total_count"] == 500
+        assert calls == [500]
+
+
+# =============================================================================
+# Failure modes: 503 when not ready, 500 when scoring breaks
+# =============================================================================
+class TestFailureModes:
+    """The service must say clearly WHY it cannot answer."""
+
+    @pytest.fixture
+    def no_model(self, monkeypatch):
+        """Simulate a process that started but could not load its model."""
+        monkeypatch.setattr(main_module, "model", None)
+
+    @pytest.fixture
+    def broken_model(self, monkeypatch):
+        """Simulate a model that raises while scoring."""
+
+        def boom(*_args, **_kwargs):
+            raise RuntimeError("simulated scoring failure")
+
+        monkeypatch.setattr(main_module.model, "score", boom)
+        monkeypatch.setattr(main_module.model, "score_batch", boom)
+
+    def test_health_reports_unhealthy_without_model(self, client, no_model):
+        data = client.get("/health").json()
+        assert data == {
+            "status": "unhealthy",
+            "model_loaded": False,
+            "model_version": main_module.MODEL_VERSION,
+        }
+
+    def test_predict_returns_503_without_model(self, client, no_model):
+        response = client.post("/predict", json=GOOD_APPLICANT)
+        assert response.status_code == 503
+        assert "not loaded" in response.json()["detail"]
+
+    def test_batch_returns_503_without_model(self, client, no_model):
+        response = client.post("/predict/batch", json={"applications": [GOOD_APPLICANT]})
+        assert response.status_code == 503
+
+    def test_validation_still_wins_without_model(self, client, no_model):
+        """A bad request is the caller's fault even when the model is down."""
+        response = client.post("/predict", json={})
+        assert response.status_code == 422
+
+    def test_model_info_without_model(self, client, no_model):
+        data = client.get("/model/info").json()
+        assert data["is_loaded"] is False
+        assert data["metrics"] is None
+
+    def test_predict_returns_500_on_scoring_error(self, client, broken_model):
+        response = client.post("/predict", json=GOOD_APPLICANT)
+        assert response.status_code == 500
+        # Internals stay in the log, not in the response.
+        assert "simulated" not in response.text
+
+    def test_batch_returns_500_on_scoring_error(self, client, broken_model):
+        response = client.post("/predict/batch", json={"applications": [GOOD_APPLICANT]})
+        assert response.status_code == 500
+        assert "simulated" not in response.text
+
+
+    def test_startup_survives_a_missing_model(self, monkeypatch):
+        """No model file: the process still starts and reports itself unhealthy.
+
+        This is what lets the container HEALTHCHECK, rather than a crash loop,
+        tell operations that the model volume is missing.
+        """
+        # Restore the real model for the other tests once this one is done.
+        monkeypatch.setattr(main_module, "model", main_module.model)
+
+        def missing_model(*_args, **_kwargs):
+            raise FileNotFoundError("models/credit_model.joblib")
+
+        monkeypatch.setattr(main_module, "CreditRiskModel", missing_model)
+        with TestClient(app) as fresh_client:
+            assert fresh_client.get("/health").json()["model_loaded"] is False
+            assert fresh_client.post("/predict", json=GOOD_APPLICANT).status_code == 503
