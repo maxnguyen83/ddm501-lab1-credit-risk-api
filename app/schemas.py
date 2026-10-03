@@ -4,30 +4,47 @@ Pydantic schemas for request/response validation.
 The schema is the API's contract. Everything the model assumes about its input
 is stated here, so a malformed request fails at the edge with a clear 422
 instead of producing a confident-looking wrong score.
-
-TODO: Complete the schema definitions below.
 """
 
 from typing import List, Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+# Domain of the repayment-status codes in the UCI dataset:
+# -2 = no consumption, -1 = paid in full, 0 = revolving credit, 1..8 = months late.
+PAY_STATUS_MIN = -2
+PAY_STATUS_MAX = 8
+
+# The six monthly values, months t-1 .. t-6, always come as a group.
+N_MONTHS = 6
 
 
 # =============================================================================
-# TODO 1: Complete the CreditApplication request schema
+# Request schema
 # =============================================================================
-# The first three fields are done for you as a worked example. Fill in the rest.
-#
-# Requirements:
-#   marriage    1 = married, 2 = single, 3 = others
-#   age         integer, 18 to 100 inclusive
-#   pay_status  list of exactly 6 integers, months t-1 .. t-6
-#   bill_amt    list of exactly 6 floats, months t-1 .. t-6
-#   pay_amt     list of exactly 6 floats, months t-1 .. t-6
-#
-
 class CreditApplication(BaseModel):
     """One applicant, as the core banking system sends it."""
+
+    # NaN / Infinity are valid JSON for Python's parser and would slip past the
+    # numeric bounds of the list fields; the gradient boosting model would then
+    # score them silently as "missing". Reject them at the edge instead.
+    model_config = ConfigDict(
+        allow_inf_nan=False,
+        json_schema_extra={
+            "examples": [
+                {
+                    "limit_bal": 300000,
+                    "sex": 2,
+                    "education": 1,
+                    "marriage": 2,
+                    "age": 38,
+                    "pay_status": [-1, -1, -1, -1, -1, -1],
+                    "bill_amt": [12000, 11500, 11000, 10500, 10000, 9500],
+                    "pay_amt": [12000, 11500, 11000, 10500, 10000, 9500],
+                }
+            ]
+        },
+    )
 
     limit_bal: float = Field(
         ..., gt=0, le=2_000_000, description="Credit limit in NT dollars", examples=[120000]
@@ -37,76 +54,108 @@ class CreditApplication(BaseModel):
         ..., description="1 = graduate school, 2 = university, 3 = high school, 4 = others",
         examples=[2],
     )
+    marriage: Literal[1, 2, 3] = Field(
+        ..., description="1 = married, 2 = single, 3 = others", examples=[2]
+    )
+    age: int = Field(..., ge=18, le=100, description="Age in years", examples=[34])
+    pay_status: List[int] = Field(
+        ...,
+        min_length=N_MONTHS,
+        max_length=N_MONTHS,
+        description=(
+            "Repayment status for months t-1 .. t-6. "
+            "-2 = no consumption, -1 = paid in full, 0 = revolving credit, "
+            "1..8 = months of payment delay."
+        ),
+        examples=[[0, 0, 0, 0, 0, 0]],
+    )
+    # No lower bound on purpose: a negative statement means the customer is in
+    # credit (overpaid), which the UCI data contains.
+    bill_amt: List[float] = Field(
+        ...,
+        min_length=N_MONTHS,
+        max_length=N_MONTHS,
+        description="Bill statement amount for months t-1 .. t-6, in NT dollars.",
+        examples=[[20000, 19000, 18000, 17000, 16000, 15000]],
+    )
+    pay_amt: List[float] = Field(
+        ...,
+        min_length=N_MONTHS,
+        max_length=N_MONTHS,
+        description="Amount actually paid for months t-1 .. t-6, in NT dollars. Never negative.",
+        examples=[[2000, 2000, 1500, 1500, 1000, 1000]],
+    )
 
-    # TODO 1a: marriage
-    # marriage: Literal[???] = Field(..., description="...", examples=[2])
+    # -------------------------------------------------------------------------
+    # Custom validators: rules on every element of a list, which Field(...)
+    # bounds cannot express (they apply to the list, not to its items).
+    # -------------------------------------------------------------------------
+    @field_validator("pay_status")
+    @classmethod
+    def pay_status_in_domain(cls, values: List[int]) -> List[int]:
+        """Every repayment-status code must be one the model was trained on."""
+        for month, code in enumerate(values, start=1):
+            if not PAY_STATUS_MIN <= code <= PAY_STATUS_MAX:
+                raise ValueError(
+                    f"pay_status for month t-{month} must be between "
+                    f"{PAY_STATUS_MIN} and {PAY_STATUS_MAX}"
+                )
+        return values
 
-    # TODO 1b: age
-    # age: int = Field(..., ge=???, le=???, description="Age in years", examples=[34])
-
-    # TODO 1c: pay_status
-    # pay_status: List[int] = Field(
-    #     ...,
-    #     min_length=???,
-    #     max_length=???,
-    #     description=(
-    #         "Repayment status for months t-1 .. t-6. "
-    #         "-2 = no consumption, -1 = paid in full, 0 = revolving credit, "
-    #         "1..8 = months of payment delay."
-    #     ),
-    #     examples=[[0, 0, 0, 0, 0, 0]],
-    # )
-
-    # TODO 1d: bill_amt
-
-    # TODO 1e: pay_amt
-
-    # =========================================================================
-    # TODO 2: Add the two custom validators
-    # =========================================================================
-    # Field(...) covers types and ranges. Some rules need real code:
-    #
-    #   2a. every value in pay_status must be between -2 and 8
-    #   2b. no value in pay_amt may be negative
-    #
+    @field_validator("pay_amt")
+    @classmethod
+    def pay_amt_not_negative(cls, values: List[float]) -> List[float]:
+        """A payment is money received; it cannot be negative."""
+        for month, amount in enumerate(values, start=1):
+            if amount < 0:
+                raise ValueError(f"pay_amt for month t-{month} cannot be negative")
+        return values
 
 
 # =============================================================================
-# TODO 3: Complete the PredictionResponse schema
+# Response schemas
 # =============================================================================
-# Requirements:
-#   default_probability  float between 0.0 and 1.0
-#   risk_band            one of "LOW", "MEDIUM", "HIGH"
-#   decision             one of "APPROVE", "REVIEW", "DECLINE"
-#   review_threshold     float — the threshold in force when this was scored
-#   decline_threshold    float — likewise
-#   model_version        string
-#
-
 class PredictionResponse(BaseModel):
     """Scoring result plus the decision derived from it."""
 
-    # TODO: define the six fields
-    pass
+    # Fields starting with "model_" clash with Pydantic's protected namespace
+    # and raise a warning at import time; the names are part of the contract,
+    # so switch the check off rather than rename them.
+    model_config = ConfigDict(protected_namespaces=())
 
+    default_probability: float = Field(
+        ..., ge=0.0, le=1.0, description="Probability of default next month, 4 d.p.",
+        examples=[0.1234],
+    )
+    risk_band: Literal["LOW", "MEDIUM", "HIGH"] = Field(
+        ..., description="Band implied by the two thresholds", examples=["LOW"]
+    )
+    decision: Literal["APPROVE", "REVIEW", "DECLINE"] = Field(
+        ..., description="Underwriting action for the band", examples=["APPROVE"]
+    )
+    review_threshold: float = Field(
+        ..., description="Review threshold in force when this was scored", examples=[0.30]
+    )
+    decline_threshold: float = Field(
+        ..., description="Decline threshold in force when this was scored", examples=[0.60]
+    )
+    model_version: str = Field(
+        ..., description="Version of the model that scored it", examples=["1.0.0"]
+    )
 
-# =============================================================================
-# TODO 4: Complete the HealthResponse schema
-# =============================================================================
-# Requirements:
-#   status         "healthy" or "unhealthy"
-#   model_loaded   boolean
-#   model_version  string
 
 class HealthResponse(BaseModel):
     """Liveness and readiness of the service."""
 
-    # TODO: define the three fields
-    pass
+    model_config = ConfigDict(protected_namespaces=())
+
+    status: Literal["healthy", "unhealthy"] = Field(..., examples=["healthy"])
+    model_loaded: bool = Field(..., description="True once the model can serve", examples=[True])
+    model_version: str = Field(..., examples=["1.0.0"])
 
 
 # =============================================================================
-# Batch schemas (PROVIDED — read them, you will need them for TODO 2 in main.py)
+# Batch schemas (PROVIDED — used by /predict/batch in main.py)
 # =============================================================================
 class BatchPredictionRequest(BaseModel):
     """Up to 500 applications scored in one call."""
