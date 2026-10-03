@@ -7,6 +7,10 @@ on:
     branches: [main]
   workflow_dispatch:
 
+# The job only reads the repository.
+permissions:
+  contents: read
+
 jobs:
   smoke:
     name: Install, train, test, build
@@ -47,6 +51,9 @@ jobs:
       - name: Run tests with coverage
         run: pytest tests/ -v --cov=app --cov-report=term-missing
 
+      - name: Validate docker-compose.yml
+        run: docker compose config --quiet
+
       - name: Build the Docker image
         run: docker build -t credit-risk-api:ci .
 
@@ -68,4 +75,40 @@ jobs:
                  "bill_amt":[12000,11500,11000,10500,10000,9500],
                  "pay_amt":[12000,11500,11000,10500,10000,9500]}' \
             | tee /dev/stderr | grep -q 'default_probability'
-          docker stop api
+          curl -sf -X POST http://localhost:8000/predict/batch \
+            -H 'Content-Type: application/json' \
+            -d '{"applications":[
+                 {"limit_bal":300000,"sex":2,"education":1,"marriage":2,"age":38,
+                  "pay_status":[-1,-1,-1,-1,-1,-1],
+                  "bill_amt":[12000,11500,11000,10500,10000,9500],
+                  "pay_amt":[12000,11500,11000,10500,10000,9500]},
+                 {"limit_bal":20000,"sex":1,"education":3,"marriage":1,"age":24,
+                  "pay_status":[4,3,3,2,2,2],
+                  "bill_amt":[19800,19500,19000,18500,18000,17500],
+                  "pay_amt":[0,0,200,0,300,0]}]}' \
+            | tee /dev/stderr | grep -q '"total_count":2'
+          curl -sf http://localhost:8000/model/info | tee /dev/stderr | grep -q '"is_loaded":true'
+          # Invalid input must be a 422, not a 500 and not a score.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -X POST http://localhost:8000/predict \
+            -H 'Content-Type: application/json' -d '{}')
+          test "$code" = "422"
+
+      - name: Container runs as non-root and the HEALTHCHECK turns healthy
+        run: |
+          test "$(docker exec api id -u)" = "1000"
+          # Probes run every 30s after a 10s start period; allow up to ~150s.
+          for i in $(seq 1 30); do
+            health=$(docker inspect --format='{{.State.Health.Status}}' api)
+            echo "health: $health"
+            [ "$health" = "healthy" ] && exit 0
+            sleep 5
+          done
+          exit 1
+
+      - name: Container logs on failure
+        if: failure()
+        run: docker logs api || true
+
+      - name: Stop the container
+        if: always()
+        run: docker rm -f api || true
