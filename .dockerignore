@@ -1,0 +1,26 @@
+# Keep the build context small and the image free of local state.
+# The Dockerfile copies only requirements.txt, app/, scripts/ and data/.
+
+# Local environments and caches (.venv alone is several hundred MB)
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+coverage.xml
+htmlcov/
+
+# The model is mounted at run time, never baked into the image
+models/
+
+# Not needed at run time
+.git/
+.github/
+tests/
+*.md
+.env
+.idea/
+.vscode/
+.DS_Store
